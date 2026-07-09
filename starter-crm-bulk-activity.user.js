@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Starter CRM — массовое управление активностью точек
 // @namespace    starter-crm-bulk-activity
-// @version      2.0
-// @description  Позволяет одним действием переключить статус активности (Включена / Временно закрыта / Отключена) сразу для нескольких точек продаж в Starter CRM, с историей изменений (общей для всех через CRM) и локальным откатом последних действий
+// @version      2.1
+// @description  Массовое управление точками в Starter CRM: активность (Включена / Временно закрыта / Отключена), СТОП Доставка и СТОП Приём заказов — с историей изменений и откатом
 // @author       you
 // @match        https://crm.starterapp.ru/*/admin/shops-management/shops*
 // @run-at       document-idle
@@ -23,6 +23,15 @@
 
   if (!PROJECT) return;
 
+  // ID операций "СТОП Доставка" / "СТОП Приём заказов" в панели управления
+  // загрузкой (/admin/shops-management/time-management?shop=ID). Проверено:
+  // ID одинаковый для всех точек проекта (это конфигурация уровня проекта,
+  // а не конкретной точки) — можно захардкодить один раз.
+  const OPERATION_IDS = {
+    stop_delivery: 'ea51ff13-6f35-4561-87e5-5e9301dda005',
+    stop_orders: 'fb696d61-0a30-4ed6-87d2-fe00a0a95442',
+  };
+
   // --- Стили ---
   const style = document.createElement('style');
   style.textContent = `
@@ -42,7 +51,7 @@
       display: flex; align-items: center; justify-content: center;
     }
     #bulk-act-modal {
-      background: #fff; width: 720px; max-width: 92vw; max-height: 86vh;
+      background: #fff; width: 780px; max-width: 94vw; max-height: 88vh;
       border-radius: 10px; display: flex; flex-direction: column;
       font: 14px/1.4 -apple-system, Segoe UI, Roboto, sans-serif; overflow: hidden;
     }
@@ -58,13 +67,13 @@
     #bulk-act-toolbar button { padding: 7px 12px; border: 1px solid #ddd; border-radius: 6px; background: #f7f7f8; cursor: pointer; }
     #bulk-act-list { overflow-y: auto; flex: 1; padding: 4px 0; }
     .bulk-act-row {
-      display: flex; align-items: center; gap: 10px; padding: 8px 20px;
-      border-bottom: 1px solid #f2f2f2; cursor: pointer;
+      display: flex; align-items: center; gap: 8px; padding: 8px 20px;
+      border-bottom: 1px solid #f2f2f2; cursor: pointer; flex-wrap: wrap;
     }
     .bulk-act-row:hover { background: #f7f9fe; }
-    .bulk-act-row .name { flex: 1; display: flex; align-items: center; gap: 8px; }
+    .bulk-act-row .name { flex: 1 1 160px; display: flex; align-items: center; gap: 8px; min-width: 160px; }
     .bulk-act-row .name .missing-label { color: #c0392b; font-style: italic; }
-    .bulk-act-row .city { color: #888; font-size: 12px; width: 110px; }
+    .bulk-act-row .city { color: #888; font-size: 12px; width: 100px; flex-shrink: 0; }
     .bulk-act-fix-link {
       font-size: 11px; color: #1a73e8; text-decoration: none; white-space: nowrap;
       border: 1px solid #1a73e8; border-radius: 999px; padding: 2px 8px;
@@ -77,16 +86,20 @@
     .bulk-act-hist-btn:hover { background: #e8eefc; }
     .bulk-act-row-history {
       display: none; font-size: 12px; color: #555; padding: 6px 20px 10px 46px; background: #fafbff;
+      flex-basis: 100%;
     }
     .bulk-act-row-history.open { display: block; }
     .bulk-act-row-history div { padding: 2px 0; }
-    .bulk-act-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+    .bulk-act-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
     .bulk-badge-active { background: #e3f7e6; color: #1a8a3d; }
     .bulk-badge-temp   { background: #fdecd2; color: #b96a00; }
     .bulk-badge-off    { background: #eee; color: #777; }
+    .bulk-badge-ok      { background: #e3f7e6; color: #1a8a3d; }
+    .bulk-badge-stop    { background: #fdecea; color: #c0392b; }
+    .bulk-badge-unknown { background: #f0f0f0; color: #999; }
     #bulk-act-footer {
       padding: 14px 20px; border-top: 1px solid #eee; display: flex;
-      align-items: center; gap: 12px; flex-wrap: wrap;
+      align-items: center; gap: 10px; flex-wrap: wrap;
     }
     #bulk-act-footer select { padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; }
     #bulk-act-apply {
@@ -196,11 +209,54 @@
     return res.json();
   }
 
+  // Живой статус СТОП Доставка / СТОП Приём заказов для одной точки.
+  // true = остановлено, false = работает, null = не удалось определить
+  // (например, у точки нет такой группы операций).
+  async function fetchShopOperations(id) {
+    try {
+      const res = await fetch(`${API_BASE}/operations/pad/${id}/operation_groups`, { credentials: 'include' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const stopGroup = (data.groups || []).find(g => g.title === null);
+      const ops = stopGroup ? stopGroup.operations : [];
+      const isSelected = (opId) => {
+        const op = ops.find(o => o.id === opId);
+        return op ? !!op.isSelected : null;
+      };
+      return {
+        stopDelivery: isSelected(OPERATION_IDS.stop_delivery),
+        stopOrders: isSelected(OPERATION_IDS.stop_orders),
+      };
+    } catch (e) {
+      return { stopDelivery: null, stopOrders: null };
+    }
+  }
+
+  // Параллельно, но с ограничением одновременных запросов, чтобы не
+  // заддосить бэкенд при большом числе точек.
+  async function mapWithConcurrency(items, limit, fn) {
+    let idx = 0;
+    async function worker() {
+      while (idx < items.length) {
+        const cur = idx++;
+        await fn(items[cur], cur);
+      }
+    }
+    const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+    await Promise.all(workers);
+  }
+
   function statusLabel(activeStatus) {
     if (activeStatus === 'active') return { text: 'Включена', cls: 'bulk-badge-active' };
     if (activeStatus === 'temporary_closed') return { text: 'Временно закрыта', cls: 'bulk-badge-temp' };
     if (activeStatus === 'not_active') return { text: 'Отключена', cls: 'bulk-badge-off' };
     return { text: activeStatus || '—', cls: 'bulk-badge-off' };
+  }
+
+  function stopBadgeHtml(label, state) {
+    if (state === true) return `<span class="bulk-act-badge bulk-badge-stop" title="${label}: остановлено">${label}: СТОП</span>`;
+    if (state === false) return `<span class="bulk-act-badge bulk-badge-ok" title="${label}: работает">${label}: ОК</span>`;
+    return `<span class="bulk-act-badge bulk-badge-unknown" title="${label}: не удалось определить">${label}: —</span>`;
   }
 
   // city у точки приходит объектом { name, country }, а не строкой
@@ -217,6 +273,51 @@
 
   function shopEditUrl(shop) {
     return `${location.origin}/${PROJECT}/admin/shops-management/shops/${shop.id}?tab=activity`;
+  }
+
+  // --- Типы массового действия ---
+  // Три независимых действия: обычная активность точки (закрытие/открытие)
+  // и два "стопа" из панели управления загрузкой. У каждого свой набор
+  // целевых значений для выпадающего списка внизу модалки.
+  const ACTIONS = {
+    activity: {
+      label: 'Активность точки',
+      targets: [
+        { value: 'active', label: 'Включена' },
+        { value: 'temporary_closed', label: 'Временно закрыта' },
+        { value: 'not_active', label: 'Отключена' },
+      ],
+    },
+    stop_delivery: {
+      label: 'СТОП Доставка',
+      targets: [
+        { value: 'select', label: 'Остановить' },
+        { value: 'unselect', label: 'Возобновить' },
+      ],
+    },
+    stop_orders: {
+      label: 'СТОП Приём заказов',
+      targets: [
+        { value: 'select', label: 'Остановить' },
+        { value: 'unselect', label: 'Возобновить' },
+      ],
+    },
+  };
+
+  const ACTIVITY_TARGET_LABELS = {
+    active: 'Включена',
+    temporary_closed: 'Временно закрыта',
+    not_active: 'Отключена',
+  };
+
+  const STOP_TARGET_LABELS = {
+    select: 'Остановлено',
+    unselect: 'Работает',
+  };
+
+  function targetLabelFor(action, value) {
+    if (action === 'activity') return ACTIVITY_TARGET_LABELS[value] || value;
+    return STOP_TARGET_LABELS[value] || value;
   }
 
   // --- История изменений (для отката) ---
@@ -270,12 +371,13 @@
           <div id="bulk-act-footer">
             <span id="bulk-act-count">Выбрано: 0</span>
             <span style="flex:1"></span>
-            <span>Новый статус:</span>
-            <select id="bulk-act-target">
-              <option value="active">Включена</option>
-              <option value="temporary_closed">Временно закрыта</option>
-              <option value="not_active">Отключена</option>
+            <span>Действие:</span>
+            <select id="bulk-act-action">
+              <option value="activity">Активность точки</option>
+              <option value="stop_delivery">СТОП Доставка</option>
+              <option value="stop_orders">СТОП Приём заказов</option>
             </select>
+            <select id="bulk-act-target"></select>
             <button id="bulk-act-apply" disabled>Применить</button>
           </div>
         </div>
@@ -295,8 +397,18 @@
     overlay.querySelector('#bulk-act-select-none').onclick = () => toggleVisible(false);
     overlay.querySelector('#bulk-act-refresh').onclick = loadShops;
     overlay.querySelector('#bulk-act-apply').onclick = applyBulk;
+    overlay.querySelector('#bulk-act-action').addEventListener('change', renderTargetOptions);
+    renderTargetOptions();
 
     await loadShops();
+  }
+
+  function renderTargetOptions() {
+    const action = overlay.querySelector('#bulk-act-action').value;
+    const targetSelect = overlay.querySelector('#bulk-act-target');
+    targetSelect.innerHTML = ACTIONS[action].targets
+      .map(t => `<option value="${t.value}">${t.label}</option>`)
+      .join('');
   }
 
   function closeModal() {
@@ -315,13 +427,14 @@
     const list = overlay.querySelector('#bulk-act-list');
     list.textContent = 'Загрузка…';
     try {
-      // Точки без названия (legalTitle === null) сортируются в начало списка,
-      // чтобы их сразу было видно и легко было перейти по ссылке "заполнить".
+      // Точки без названия (legalTitle === null) не должны ронять сортировку —
+      // shopTitle() подставляет '' вместо null.
       shops = (await fetchShops()).sort((a, b) => shopTitle(a).localeCompare(shopTitle(b), 'ru'));
     } catch (e) {
       list.textContent = 'Ошибка загрузки: ' + e.message;
       return;
     }
+
     const citySelect = overlay.querySelector('#bulk-act-city');
     const cityMap = new Map(); // cityId -> name
     shops.forEach(s => {
@@ -333,6 +446,16 @@
     citySelect.innerHTML = '<option value="">Все города</option>' +
       cities.map(([id, name]) => `<option value="${id}">${name}</option>`).join('');
     if ([...citySelect.options].some(o => o.value === prevValue)) citySelect.value = prevValue;
+
+    // Живой статус СТОП по каждой точке — отдельные запросы, ограниченные
+    // по параллельности, чтобы не заддосить бэкенд списком из полусотни точек.
+    list.textContent = 'Загрузка статусов СТОП…';
+    await mapWithConcurrency(shops, 6, async (s) => {
+      const ops = await fetchShopOperations(s.id);
+      s.stopDelivery = ops.stopDelivery;
+      s.stopOrders = ops.stopOrders;
+    });
+
     renderList();
   }
 
@@ -362,6 +485,8 @@
             <span class="name">${nameHtml}</span>
             <span class="city">${cityName(s)}</span>
             <span class="bulk-act-badge ${st.cls}">${st.text}</span>
+            ${stopBadgeHtml('Дост.', s.stopDelivery)}
+            ${stopBadgeHtml('Приём', s.stopOrders)}
             <button type="button" class="bulk-act-hist-btn" title="История изменений этой точки (общая для всех, из CRM)">🕘</button>
           </div>
           <div class="bulk-act-row-history"></div>
@@ -393,6 +518,9 @@
 
   // Настоящая, серверная история изменений точки (эндпоинт самой CRM) —
   // видна всем, у кого есть доступ к CRM, независимо от браузера.
+  // Показывает изменения активности (закрыта/открыта); изменения СТОП
+  // Доставка / Приём заказов через этот эндпоинт не приходят — это отдельная
+  // лента событий на стороне CRM, которую скрипт не запрашивает.
   const shopHistoryCache = new Map();
 
   async function fetchShopHistory(id) {
@@ -406,7 +534,7 @@
 
   function describeHistoryEntry(entry) {
     if (entry.event === 'update_shop_status') {
-      return TARGET_LABELS[entry.data.status] || entry.data.status;
+      return ACTIVITY_TARGET_LABELS[entry.data.status] || entry.data.status;
     }
     if (entry.event === 'update_shop_closed') {
       return entry.data.isClosed ? 'Временно закрыта' : 'Включена';
@@ -457,15 +585,8 @@
     overlay.querySelector('#bulk-act-apply').disabled = n === 0;
   }
 
-  const TARGET_LABELS = {
-    active: 'Включена',
-    temporary_closed: 'Временно закрыта',
-    not_active: 'Отключена',
-  };
-
-  // Тот же способ, которым сама CRM переключает статус активности точки —
-  // трёх разных состояний (Включена / Временно закрыта / Отключена)
-  // на бэкенде отвечают два разных эндпоинта.
+  // Активность точки — тот же способ, которым сама CRM переключает статус
+  // (трёх состояний отвечают два разных эндпоинта).
   async function patchStatus(id, target) {
     if (target === 'temporary_closed') {
       return fetch(`${API_BASE}/shop/${id}/closed?isClosed=true`, { method: 'PATCH', credentials: 'include' });
@@ -477,12 +598,29 @@
     return fetch(`${API_BASE}/shop/${id}/status?shop_status=not_active`, { method: 'PATCH', credentials: 'include' });
   }
 
+  // СТОП Доставка / СТОП Приём заказов — тот же способ, которым панель
+  // управления загрузкой (time-management) переключает эти кнопки.
+  // target: 'select' (включить СТОП) | 'unselect' (снять СТОП)
+  async function patchOperation(id, operationId, target) {
+    return fetch(`${API_BASE}/operations/pad/${id}/${operationId}/${target}`, {
+      method: 'POST',
+      credentials: 'include',
+    });
+  }
+
+  async function applyAction(action, id, target) {
+    if (action === 'activity') return patchStatus(id, target);
+    return patchOperation(id, OPERATION_IDS[action], target);
+  }
+
   async function applyBulk() {
     const ids = getSelectedIds();
+    const action = overlay.querySelector('#bulk-act-action').value;
     const target = overlay.querySelector('#bulk-act-target').value;
-    const targetLabel = TARGET_LABELS[target] || target;
+    const actionDef = ACTIONS[action];
+    const targetLabel = actionDef.targets.find(t => t.value === target).label;
 
-    if (!confirm(`Переключить ${ids.length} точек(и) в статус «${targetLabel}»?`)) return;
+    if (!confirm(`${targetLabel} — «${actionDef.label}» для ${ids.length} точек(и)?`)) return;
 
     const log = overlay.querySelector('#bulk-act-log');
     log.style.display = 'block';
@@ -497,20 +635,37 @@
       log.scrollTop = log.scrollHeight;
     };
 
-    // Снимок состояния "до" — только для тех точек, где смена реально удалась,
-    // чтобы потом можно было откатить именно партию изменений.
+    // Снимок состояния "до" — только для тех точек, где смена реально удалась
+    // И где известно исходное состояние, чтобы потом можно было откатить
+    // именно партию изменений. Для СТОП-действий "исходное состояние" — это
+    // просто противоположное значение select/unselect.
     const changedItems = [];
 
     for (const id of ids) {
       const shop = shops.find(s => s.id === id);
       const name = shop ? (shop.legalTitle || `#${id} (без названия)`) : id;
-      const prevStatus = shop ? shop.activeStatus : null;
+
+      let prevValue = null;
+      if (shop) {
+        if (action === 'activity') {
+          prevValue = shop.activeStatus;
+        } else {
+          const cur = action === 'stop_delivery' ? shop.stopDelivery : shop.stopOrders;
+          prevValue = cur === true ? 'select' : cur === false ? 'unselect' : null;
+        }
+      }
+
       try {
-        const res = await patchStatus(id, target);
+        const res = await applyAction(action, id, target);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         addLine(`✓ ${name}`, 'bulk-log-ok');
-        if (prevStatus && prevStatus !== target) {
-          changedItems.push({ id, name, prevStatus, prevLabel: TARGET_LABELS[prevStatus] || prevStatus });
+        if (prevValue !== null && prevValue !== target) {
+          changedItems.push({
+            id,
+            name,
+            prevValue,
+            prevLabel: targetLabelFor(action, prevValue),
+          });
         }
       } catch (e) {
         addLine(`✗ ${name}: ${e.message}`, 'bulk-log-err');
@@ -522,6 +677,8 @@
       const history = loadHistory();
       history.push({
         ts: Date.now(),
+        kind: action,
+        actionLabel: actionDef.label,
         target,
         targetLabel,
         items: changedItems,
@@ -553,7 +710,7 @@
       <div class="bulk-hist-batch" data-ts="${batch.ts}">
         <div class="bulk-hist-head">
           <span class="bulk-hist-date">${formatDate(batch.ts)}</span>
-          <span class="bulk-hist-target">→ ${batch.targetLabel}</span>
+          <span class="bulk-hist-target">${batch.actionLabel} → ${batch.targetLabel}</span>
           <span class="bulk-hist-count">${batch.items.length} точек(и)</span>
           ${batch.rolledBack ? '<span class="bulk-hist-rolledback">откачено</span>' : ''}
           <button class="bulk-hist-toggle" type="button">Показать точки</button>
@@ -584,7 +741,7 @@
     const batch = history.find(b => b.ts === ts);
     if (!batch || batch.rolledBack) return;
 
-    if (!confirm(`Откатить ${batch.items.length} точек(и) к состоянию до изменения на «${batch.targetLabel}» (${formatDate(batch.ts)})?`)) return;
+    if (!confirm(`Откатить ${batch.items.length} точек(и) к состоянию до изменения «${batch.actionLabel} → ${batch.targetLabel}» (${formatDate(batch.ts)})?`)) return;
 
     const batchEl = overlay.querySelector(`.bulk-hist-batch[data-ts="${ts}"]`);
     const logEl = batchEl.querySelector('.bulk-hist-log');
@@ -595,7 +752,7 @@
     for (const item of batch.items) {
       const line = document.createElement('div');
       try {
-        const res = await patchStatus(item.id, item.prevStatus);
+        const res = await applyAction(batch.kind, item.id, item.prevValue);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         line.className = 'bulk-log-ok';
         line.textContent = `✓ ${item.name} → «${item.prevLabel}»`;
