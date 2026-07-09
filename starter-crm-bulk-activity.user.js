@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Starter CRM — массовое управление активностью точек
 // @namespace    starter-crm-bulk-activity
-// @version      1.7
-// @description  Позволяет одним действием переключить статус активности (Включена / Временно закрыта / Отключена) сразу для нескольких точек продаж в Starter CRM
+// @version      2.0
+// @description  Позволяет одним действием переключить статус активности (Включена / Временно закрыта / Отключена) сразу для нескольких точек продаж в Starter CRM, с историей изменений (общей для всех через CRM) и локальным откатом последних действий
 // @author       you
 // @match        https://crm.starterapp.ru/*/admin/shops-management/shops*
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @updateURL    https://raw.githubusercontent.com/Gnomophile/CRM-mass-editing/main/starter-crm-bulk-activity.user.js
 // @downloadURL  https://raw.githubusercontent.com/Gnomophile/CRM-mass-editing/main/starter-crm-bulk-activity.user.js
 // ==/UserScript==
@@ -61,8 +62,24 @@
       border-bottom: 1px solid #f2f2f2; cursor: pointer;
     }
     .bulk-act-row:hover { background: #f7f9fe; }
-    .bulk-act-row .name { flex: 1; }
+    .bulk-act-row .name { flex: 1; display: flex; align-items: center; gap: 8px; }
+    .bulk-act-row .name .missing-label { color: #c0392b; font-style: italic; }
     .bulk-act-row .city { color: #888; font-size: 12px; width: 110px; }
+    .bulk-act-fix-link {
+      font-size: 11px; color: #1a73e8; text-decoration: none; white-space: nowrap;
+      border: 1px solid #1a73e8; border-radius: 999px; padding: 2px 8px;
+    }
+    .bulk-act-fix-link:hover { background: #eaf1fd; }
+    .bulk-act-hist-btn {
+      border: none; background: none; cursor: pointer; font-size: 14px; padding: 2px 4px;
+      border-radius: 4px; line-height: 1;
+    }
+    .bulk-act-hist-btn:hover { background: #e8eefc; }
+    .bulk-act-row-history {
+      display: none; font-size: 12px; color: #555; padding: 6px 20px 10px 46px; background: #fafbff;
+    }
+    .bulk-act-row-history.open { display: block; }
+    .bulk-act-row-history div { padding: 2px 0; }
     .bulk-act-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
     .bulk-badge-active { background: #e3f7e6; color: #1a8a3d; }
     .bulk-badge-temp   { background: #fdecd2; color: #b96a00; }
@@ -84,6 +101,29 @@
     }
     .bulk-log-ok  { color: #1a8a3d; }
     .bulk-log-err { color: #c0392b; }
+    #bulk-act-tabs { display: flex; gap: 4px; padding: 10px 20px 0; border-bottom: 1px solid #eee; }
+    .bulk-act-tab {
+      padding: 8px 14px; border: none; background: none; cursor: pointer;
+      font-weight: 600; color: #888; border-bottom: 2px solid transparent;
+    }
+    .bulk-act-tab.active { color: #1a73e8; border-bottom-color: #1a73e8; }
+    #bulk-act-tab-shops { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    #bulk-act-history { overflow-y: auto; flex: 1; padding: 8px 20px; }
+    .bulk-hist-batch { border: 1px solid #eee; border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+    .bulk-hist-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .bulk-hist-date { color: #888; font-size: 12px; }
+    .bulk-hist-target { font-weight: 600; }
+    .bulk-hist-count { color: #555; font-size: 12px; }
+    .bulk-hist-rolledback { color: #888; font-size: 12px; font-style: italic; }
+    .bulk-hist-toggle, .bulk-hist-rollback {
+      margin-left: auto; padding: 5px 10px; border: 1px solid #ddd; border-radius: 6px;
+      background: #f7f7f8; cursor: pointer; font-size: 12px;
+    }
+    .bulk-hist-rollback { border-color: #1a73e8; color: #1a73e8; background: #fff; }
+    .bulk-hist-rollback:disabled { color: #aaa; border-color: #ddd; cursor: not-allowed; }
+    .bulk-hist-items { margin-top: 8px; font-size: 12px; color: #555; display: none; }
+    .bulk-hist-items div { padding: 2px 0; }
+    #bulk-act-history-empty { padding: 30px; text-align: center; color: #888; }
   `;
   document.head.appendChild(style);
 
@@ -168,6 +208,42 @@
     return (shop.city && shop.city.name || '').trim();
   }
 
+  // legalTitle бывает null у точек, где название ещё не заполнили.
+  // Используется в сортировке и отображении — вынесено отдельно, чтобы
+  // не потерять null-проверку где-нибудь ещё в будущем.
+  function shopTitle(shop) {
+    return shop.legalTitle || '';
+  }
+
+  function shopEditUrl(shop) {
+    return `${location.origin}/${PROJECT}/admin/shops-management/shops/${shop.id}?tab=activity`;
+  }
+
+  // --- История изменений (для отката) ---
+  // Храним последние HISTORY_LIMIT партий изменений через GM_setValue —
+  // это переживает перезагрузку страницы и закрытие браузера (в отличие от
+  // обычной переменной в памяти).
+  const HISTORY_KEY = 'bulk-act-history';
+  const HISTORY_LIMIT = 30;
+
+  function loadHistory() {
+    try {
+      return JSON.parse(GM_getValue(HISTORY_KEY, '[]'));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveHistory(batches) {
+    GM_setValue(HISTORY_KEY, JSON.stringify(batches.slice(-HISTORY_LIMIT)));
+  }
+
+  function formatDate(ts) {
+    const d = new Date(ts);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
   async function openModal() {
     overlay = document.createElement('div');
     overlay.id = 'bulk-act-overlay';
@@ -177,29 +253,40 @@
           <h2>Массовое управление активностью — ${PROJECT}</h2>
           <button id="bulk-act-close">✕</button>
         </header>
-        <div id="bulk-act-toolbar">
-          <select id="bulk-act-city"><option value="">Все города</option></select>
-          <span style="flex:1"></span>
-          <button id="bulk-act-select-all">Выбрать все видимые</button>
-          <button id="bulk-act-select-none">Снять выбор</button>
-          <button id="bulk-act-refresh">↻ Обновить</button>
+        <div id="bulk-act-tabs">
+          <button class="bulk-act-tab active" data-tab="shops">Точки</button>
+          <button class="bulk-act-tab" data-tab="history">История / Откат</button>
         </div>
-        <div id="bulk-act-list">Загрузка…</div>
-        <div id="bulk-act-log"></div>
-        <div id="bulk-act-footer">
-          <span id="bulk-act-count">Выбрано: 0</span>
-          <span style="flex:1"></span>
-          <span>Новый статус:</span>
-          <select id="bulk-act-target">
-            <option value="active">Включена</option>
-            <option value="temporary_closed">Временно закрыта</option>
-            <option value="not_active">Отключена</option>
-          </select>
-          <button id="bulk-act-apply" disabled>Применить</button>
+        <div id="bulk-act-tab-shops">
+          <div id="bulk-act-toolbar">
+            <select id="bulk-act-city"><option value="">Все города</option></select>
+            <span style="flex:1"></span>
+            <button id="bulk-act-select-all">Выбрать все видимые</button>
+            <button id="bulk-act-select-none">Снять выбор</button>
+            <button id="bulk-act-refresh">↻ Обновить</button>
+          </div>
+          <div id="bulk-act-list">Загрузка…</div>
+          <div id="bulk-act-log"></div>
+          <div id="bulk-act-footer">
+            <span id="bulk-act-count">Выбрано: 0</span>
+            <span style="flex:1"></span>
+            <span>Новый статус:</span>
+            <select id="bulk-act-target">
+              <option value="active">Включена</option>
+              <option value="temporary_closed">Временно закрыта</option>
+              <option value="not_active">Отключена</option>
+            </select>
+            <button id="bulk-act-apply" disabled>Применить</button>
+          </div>
         </div>
+        <div id="bulk-act-history" style="display:none"></div>
       </div>
     `;
     document.body.appendChild(overlay);
+
+    overlay.querySelectorAll('.bulk-act-tab').forEach(tab => {
+      tab.onclick = () => switchTab(tab.dataset.tab);
+    });
 
     overlay.querySelector('#bulk-act-close').onclick = closeModal;
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
@@ -217,11 +304,20 @@
     overlay = null;
   }
 
+  function switchTab(tab) {
+    overlay.querySelectorAll('.bulk-act-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+    overlay.querySelector('#bulk-act-tab-shops').style.display = tab === 'shops' ? '' : 'none';
+    overlay.querySelector('#bulk-act-history').style.display = tab === 'history' ? '' : 'none';
+    if (tab === 'history') renderHistory();
+  }
+
   async function loadShops() {
     const list = overlay.querySelector('#bulk-act-list');
     list.textContent = 'Загрузка…';
     try {
-      shops = (await fetchShops()).sort((a, b) => a.legalTitle.localeCompare(b.legalTitle, 'ru'));
+      // Точки без названия (legalTitle === null) сортируются в начало списка,
+      // чтобы их сразу было видно и легко было перейти по ссылке "заполнить".
+      shops = (await fetchShops()).sort((a, b) => shopTitle(a).localeCompare(shopTitle(b), 'ru'));
     } catch (e) {
       list.textContent = 'Ошибка загрузки: ' + e.message;
       return;
@@ -254,20 +350,94 @@
     list.innerHTML = filtered.map(s => {
       const st = statusLabel(s.activeStatus);
       const checked = selectedIds.has(s.id) ? 'checked' : '';
+      const nameHtml = s.legalTitle
+        ? s.legalTitle
+        : `<span class="missing-label">Без названия (#${s.id})</span>` +
+          `<a class="bulk-act-fix-link" href="${shopEditUrl(s)}" target="_blank" rel="noopener" ` +
+          `title="Открыть настройки этой точки, чтобы задать название">заполнить →</a>`;
       return `
-        <label class="bulk-act-row">
-          <input type="checkbox" data-id="${s.id}" ${checked}>
-          <span class="name">${s.legalTitle}</span>
-          <span class="city">${cityName(s)}</span>
-          <span class="bulk-act-badge ${st.cls}">${st.text}</span>
-        </label>
+        <div class="bulk-act-row-wrap" data-shop-id="${s.id}">
+          <div class="bulk-act-row">
+            <input type="checkbox" data-id="${s.id}" ${checked}>
+            <span class="name">${nameHtml}</span>
+            <span class="city">${cityName(s)}</span>
+            <span class="bulk-act-badge ${st.cls}">${st.text}</span>
+            <button type="button" class="bulk-act-hist-btn" title="История изменений этой точки (общая для всех, из CRM)">🕘</button>
+          </div>
+          <div class="bulk-act-row-history"></div>
+        </div>
       `;
     }).join('') || '<div style="padding:20px;color:#888">Ничего не найдено</div>';
 
     list.querySelectorAll('input[type=checkbox]').forEach(cb => {
       cb.addEventListener('change', updateCount);
     });
+    list.querySelectorAll('.bulk-act-row').forEach(row => {
+      row.addEventListener('click', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.closest('.bulk-act-hist-btn') || e.target.closest('.bulk-act-fix-link')) return;
+        const cb = row.querySelector('input[type=checkbox]');
+        cb.checked = !cb.checked;
+        cb.dispatchEvent(new Event('change'));
+      });
+    });
+    list.querySelectorAll('.bulk-act-hist-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const wrap = btn.closest('.bulk-act-row-wrap');
+        toggleShopHistory(Number(wrap.dataset.shopId), wrap.querySelector('.bulk-act-row-history'));
+      });
+    });
     updateCount();
+  }
+
+  // Настоящая, серверная история изменений точки (эндпоинт самой CRM) —
+  // видна всем, у кого есть доступ к CRM, независимо от браузера.
+  const shopHistoryCache = new Map();
+
+  async function fetchShopHistory(id) {
+    if (shopHistoryCache.has(id)) return shopHistoryCache.get(id);
+    const res = await fetch(`${API_BASE}/shop/${id}/history?historyLimit=8&historyPage=1`, { credentials: 'include' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    shopHistoryCache.set(id, data.history || []);
+    return data.history || [];
+  }
+
+  function describeHistoryEntry(entry) {
+    if (entry.event === 'update_shop_status') {
+      return TARGET_LABELS[entry.data.status] || entry.data.status;
+    }
+    if (entry.event === 'update_shop_closed') {
+      return entry.data.isClosed ? 'Временно закрыта' : 'Включена';
+    }
+    return entry.event;
+  }
+
+  async function toggleShopHistory(id, container) {
+    const showing = container.classList.contains('open');
+    if (showing) {
+      container.classList.remove('open');
+      container.innerHTML = '';
+      return;
+    }
+    container.classList.add('open');
+    container.textContent = 'Загрузка истории…';
+    try {
+      const history = await fetchShopHistory(id);
+      if (!history.length) {
+        container.textContent = 'Изменений пока не было';
+        return;
+      }
+      container.innerHTML = history.map(h => {
+        const d = new Date(h.at);
+        const pad = (n) => String(n).padStart(2, '0');
+        const dateStr = `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        return `<div>${dateStr} — <b>${h.username}</b> → «${describeHistoryEntry(h)}»</div>`;
+      }).join('');
+    } catch (e) {
+      container.textContent = 'Не удалось загрузить историю: ' + e.message;
+    }
   }
 
   function getSelectedIds() {
@@ -327,17 +497,37 @@
       log.scrollTop = log.scrollHeight;
     };
 
+    // Снимок состояния "до" — только для тех точек, где смена реально удалась,
+    // чтобы потом можно было откатить именно партию изменений.
+    const changedItems = [];
+
     for (const id of ids) {
       const shop = shops.find(s => s.id === id);
-      const name = shop ? shop.legalTitle : id;
+      const name = shop ? (shop.legalTitle || `#${id} (без названия)`) : id;
+      const prevStatus = shop ? shop.activeStatus : null;
       try {
         const res = await patchStatus(id, target);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         addLine(`✓ ${name}`, 'bulk-log-ok');
+        if (prevStatus && prevStatus !== target) {
+          changedItems.push({ id, name, prevStatus, prevLabel: TARGET_LABELS[prevStatus] || prevStatus });
+        }
       } catch (e) {
         addLine(`✗ ${name}: ${e.message}`, 'bulk-log-err');
       }
       await new Promise(r => setTimeout(r, 250)); // небольшая пауза между запросами
+    }
+
+    if (changedItems.length) {
+      const history = loadHistory();
+      history.push({
+        ts: Date.now(),
+        target,
+        targetLabel,
+        items: changedItems,
+        rolledBack: false,
+      });
+      saveHistory(history);
     }
 
     const done = document.createElement('div');
@@ -348,5 +538,78 @@
 
     await loadShops();
     overlay.querySelector('#bulk-act-apply').disabled = getSelectedIds().length === 0;
+  }
+
+  function renderHistory() {
+    const box = overlay.querySelector('#bulk-act-history');
+    const history = loadHistory();
+
+    if (!history.length) {
+      box.innerHTML = '<div id="bulk-act-history-empty">Пока нет ни одного массового изменения</div>';
+      return;
+    }
+
+    box.innerHTML = [...history].reverse().map(batch => `
+      <div class="bulk-hist-batch" data-ts="${batch.ts}">
+        <div class="bulk-hist-head">
+          <span class="bulk-hist-date">${formatDate(batch.ts)}</span>
+          <span class="bulk-hist-target">→ ${batch.targetLabel}</span>
+          <span class="bulk-hist-count">${batch.items.length} точек(и)</span>
+          ${batch.rolledBack ? '<span class="bulk-hist-rolledback">откачено</span>' : ''}
+          <button class="bulk-hist-toggle" type="button">Показать точки</button>
+          <button class="bulk-hist-rollback" type="button" ${batch.rolledBack ? 'disabled' : ''}>Откатить</button>
+        </div>
+        <div class="bulk-hist-items">
+          ${batch.items.map(it => `<div>${it.name}: было «${it.prevLabel}» → стало «${batch.targetLabel}»</div>`).join('')}
+        </div>
+        <div class="bulk-hist-log" style="display:none"></div>
+      </div>
+    `).join('');
+
+    box.querySelectorAll('.bulk-hist-toggle').forEach(btn => {
+      btn.onclick = () => {
+        const itemsEl = btn.closest('.bulk-hist-batch').querySelector('.bulk-hist-items');
+        const showing = itemsEl.style.display === 'block';
+        itemsEl.style.display = showing ? 'none' : 'block';
+        btn.textContent = showing ? 'Показать точки' : 'Скрыть точки';
+      };
+    });
+    box.querySelectorAll('.bulk-hist-rollback').forEach(btn => {
+      btn.onclick = () => rollbackBatch(Number(btn.closest('.bulk-hist-batch').dataset.ts));
+    });
+  }
+
+  async function rollbackBatch(ts) {
+    const history = loadHistory();
+    const batch = history.find(b => b.ts === ts);
+    if (!batch || batch.rolledBack) return;
+
+    if (!confirm(`Откатить ${batch.items.length} точек(и) к состоянию до изменения на «${batch.targetLabel}» (${formatDate(batch.ts)})?`)) return;
+
+    const batchEl = overlay.querySelector(`.bulk-hist-batch[data-ts="${ts}"]`);
+    const logEl = batchEl.querySelector('.bulk-hist-log');
+    logEl.style.display = 'block';
+    logEl.innerHTML = '';
+    batchEl.querySelector('.bulk-hist-rollback').disabled = true;
+
+    for (const item of batch.items) {
+      const line = document.createElement('div');
+      try {
+        const res = await patchStatus(item.id, item.prevStatus);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        line.className = 'bulk-log-ok';
+        line.textContent = `✓ ${item.name} → «${item.prevLabel}»`;
+      } catch (e) {
+        line.className = 'bulk-log-err';
+        line.textContent = `✗ ${item.name}: ${e.message}`;
+      }
+      logEl.appendChild(line);
+      await new Promise(r => setTimeout(r, 250));
+    }
+
+    batch.rolledBack = true;
+    saveHistory(history);
+    renderHistory();
+    await loadShops();
   }
 })();
