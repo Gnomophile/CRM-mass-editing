@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Starter CRM — массовое управление активностью точек
 // @namespace    starter-crm-bulk-activity
-// @version      2.1
-// @description  Массовое управление точками в Starter CRM: активность (Включена / Временно закрыта / Отключена), СТОП Доставка и СТОП Приём заказов — с историей изменений и откатом
+// @version      2.2
+// @description  Массовое управление точками в Starter CRM: активность (Включена / Временно закрыта / Отключена), СТОП Доставка и СТОП Приём заказов — с историей изменений и откатом. v2.2: исправлен переход из "Отключена" в "Включена"/"Временно закрыта" (status и isClosed — независимые поля), увеличена пауза между запросами
 // @author       you
 // @match        https://crm.starterapp.ru/*/admin/shops-management/shops*
 // @run-at       document-idle
@@ -31,6 +31,11 @@
     stop_delivery: 'ea51ff13-6f35-4561-87e5-5e9301dda005',
     stop_orders: 'fb696d61-0a30-4ed6-87d2-fe00a0a95442',
   };
+
+  // Пауза между запросами при массовом применении. Поднята с 250 до 600 мс:
+  // при параллельной обработке сразу нескольких точек бэкенд периодически
+  // отдавал 503 на PATCH .../closed и .../status при более короткой паузе.
+  const REQUEST_DELAY_MS = 600;
 
   // --- Стили ---
   const style = document.createElement('style');
@@ -585,17 +590,40 @@
     overlay.querySelector('#bulk-act-apply').disabled = n === 0;
   }
 
-  // Активность точки — тот же способ, которым сама CRM переключает статус
-  // (трёх состояний отвечают два разных эндпоинта).
+  // Активность точки — тот же способ, которым сама CRM переключает статус.
+  //
+  // На бэкенде это ДВА независимых поля:
+  //   status      — 'active' | 'not_active' (Отключена — это всегда status=not_active)
+  //   isClosed    — true | false (работает только пока status='active'; определяет
+  //                 Включена (false) / Временно закрыта (true))
+  //
+  // Раньше при target === 'active' скрипт дёргал только .../closed?isClosed=false.
+  // Это верно, если точка была "Временно закрыта" (status уже 'active'), но если
+  // точка была "Отключена" (status='not_active'), запрос ничего не менял в status —
+  // PATCH отвечал 200/204 (выглядело как успех), а точка так и оставалась отключена.
+  //
+  // Фикс: для target 'active' и 'temporary_closed' сначала гарантированно переводим
+  // status в 'active' (если точка уже активна — это просто лишний, но безвредный
+  // запрос), и только потом переключаем isClosed.
   async function patchStatus(id, target) {
+    if (target === 'not_active') {
+      return fetch(`${API_BASE}/shop/${id}/status?shop_status=not_active`, { method: 'PATCH', credentials: 'include' });
+    }
+
+    // target === 'active' | 'temporary_closed' — сначала убеждаемся, что точка
+    // не "Отключена" на уровне status, иначе следующий шаг ни на что не повлияет.
+    const statusRes = await fetch(`${API_BASE}/shop/${id}/status?shop_status=active`, { method: 'PATCH', credentials: 'include' });
+    if (!statusRes.ok) return statusRes;
+
+    // Небольшая пауза между двумя последовательными запросами для одной точки,
+    // чтобы не бить по бэкенду двумя PATCH почти одновременно.
+    await new Promise(r => setTimeout(r, 150));
+
     if (target === 'temporary_closed') {
       return fetch(`${API_BASE}/shop/${id}/closed?isClosed=true`, { method: 'PATCH', credentials: 'include' });
     }
-    if (target === 'active') {
-      return fetch(`${API_BASE}/shop/${id}/closed?isClosed=false`, { method: 'PATCH', credentials: 'include' });
-    }
-    // not_active
-    return fetch(`${API_BASE}/shop/${id}/status?shop_status=not_active`, { method: 'PATCH', credentials: 'include' });
+    // target === 'active'
+    return fetch(`${API_BASE}/shop/${id}/closed?isClosed=false`, { method: 'PATCH', credentials: 'include' });
   }
 
   // СТОП Доставка / СТОП Приём заказов — тот же способ, которым панель
@@ -670,7 +698,7 @@
       } catch (e) {
         addLine(`✗ ${name}: ${e.message}`, 'bulk-log-err');
       }
-      await new Promise(r => setTimeout(r, 250)); // небольшая пауза между запросами
+      await new Promise(r => setTimeout(r, REQUEST_DELAY_MS)); // пауза между точками
     }
 
     if (changedItems.length) {
@@ -761,7 +789,7 @@
         line.textContent = `✗ ${item.name}: ${e.message}`;
       }
       logEl.appendChild(line);
-      await new Promise(r => setTimeout(r, 250));
+      await new Promise(r => setTimeout(r, REQUEST_DELAY_MS));
     }
 
     batch.rolledBack = true;
